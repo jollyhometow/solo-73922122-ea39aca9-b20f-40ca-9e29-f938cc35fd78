@@ -21,7 +21,7 @@ import httpx
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
-from scripts.demo import build_demo_articles  # noqa: E402
+from scripts.demo import build_demo_articles, mojibake  # noqa: E402
 
 COMPARE_DELAY_MS = 1500
 FAILURES = []
@@ -117,6 +117,7 @@ def main():
 
     try:
         run_checks(base1, base2, s1, s2)
+        run_encoding_checks(base1, base2)
     finally:
         s1.kill()
         s2.kill()
@@ -287,6 +288,213 @@ def run_checks(base1, base2, s1, s2):
     check("clean corpus reported as uncontaminated once verified",
           r.status_code == 200 and r.json()["contaminated"] is False
           and r.json()["groups"] == [])
+
+
+def run_encoding_checks(base1, base2):
+    """Encoding-repair API: preview candidates, atomic confirm, versioning."""
+    # moji-1 (train) is the corrupted twin of moji-2 (test, clean): they are
+    # too different to be linked before the repair (jaccard ~0.71) and
+    # identical after it, so the repair visibly changes the verdict.
+    clean_base = ("the café terrace charges €5 for excellent coffee every "
+                  "single morning while naïve visitors don’t mind waiting "
+                  "outside in the long queue")
+    broken = [mojibake("café", "latin-1"), mojibake("€", "cp1252"),
+              mojibake("naïve", "latin-1"), mojibake("’", "cp1252")]
+    corrupted1 = clean_base
+    for bad, good in zip(broken, ["café", "€", "naïve", "’"]):
+        corrupted1 = corrupted1.replace(good, bad)
+
+    clean3 = "a completely different dispatch about harvests and rural cafés doesn’t mention cities"
+    broken3 = [mojibake("cafés", "latin-1"), mojibake("’", "cp1252")]
+    corrupted3 = clean3.replace("cafés", broken3[0]).replace("’", broken3[1])
+
+    r = httpx.post(f"{base1}/articles/batch", json={"upserts": [
+        {"id": "moji-1", "side": "train", "text": corrupted1},
+        {"id": "moji-2", "side": "test", "text": clean_base},
+        {"id": "moji-3", "side": "test", "text": corrupted3},
+    ]})
+    check("corrupted articles committed", r.status_code == 200)
+    gen_seeded = r.json()["generation"]
+    wait_ready(base1)
+    r = httpx.get(f"{base1}/contamination")
+    grouped = {m for g in r.json()["groups"] for m in g["train_members"] + g["test_members"]}
+    check("corrupted twin not linked to its clean original before repair",
+          "moji-1" not in grouped and "moji-2" not in grouped)
+
+    arts = {a["id"]: a for a in httpx.get(f"{base1}/articles").json()["articles"]}
+    v1, v3 = arts["moji-1"]["updated_generation"], arts["moji-3"]["updated_generation"]
+
+    def spans(text, needles):
+        out = []
+        for n in needles:
+            s = text.index(n)
+            out.append({"start": s, "end": s + len(n)})
+        return out
+
+    iv1 = spans(corrupted1, broken)
+    iv3 = spans(corrupted3, broken3)
+
+    # ---- request shape validation ------------------------------------------
+    r = httpx.post(f"{base1}/encoding-fix/preview", json={"articles": [
+        {"id": "moji-1", "updated_generation": v1,
+         "intervals": [{"start": 4, "end": 10}, {"start": 8, "end": 14}]}]})
+    check("overlapping intervals rejected (422)", r.status_code == 422)
+    r = httpx.post(f"{base1}/encoding-fix/preview", json={"articles": [
+        {"id": "moji-1", "updated_generation": v1,
+         "intervals": [{"start": 2 * i, "end": 2 * i + 1} for i in range(7)]}]})
+    check("more than 6 intervals per article rejected (422)", r.status_code == 422)
+    r = httpx.post(f"{base1}/encoding-fix/preview", json={"articles": [
+        {"id": f"a{i}", "updated_generation": 0, "intervals": [{"start": 0, "end": 1}]}
+        for i in range(6)]})
+    check("more than 5 articles per request rejected (422)", r.status_code == 422)
+    r = httpx.post(f"{base1}/encoding-fix/preview", json={"articles": [
+        {"id": "moji-1", "updated_generation": v1, "intervals": [{"start": 5, "end": 5}]}]})
+    check("empty interval rejected (422)", r.status_code == 422)
+    r = httpx.post(f"{base1}/encoding-fix/confirm", json={"articles": [
+        {"id": "moji-1", "updated_generation": v1,
+         "fixes": [{"start": 0, "end": 2, "conversion": "latin-1", "replacement": "xx"}]},
+        {"id": "moji-1", "updated_generation": v1,
+         "fixes": [{"start": 3, "end": 5, "conversion": "latin-1", "replacement": "yy"}]}]})
+    check("duplicate article ids in confirm rejected (422)", r.status_code == 422)
+
+    # ---- preview -------------------------------------------------------------
+    r = httpx.post(f"{base2}/encoding-fix/preview", json={"articles": [
+        {"id": "moji-1", "updated_generation": v1, "intervals": iv1},
+        {"id": "moji-3", "updated_generation": v3, "intervals": iv3},
+        {"id": "ghost", "updated_generation": 0, "intervals": [{"start": 0, "end": 1}]},
+    ]})
+    check("preview accepted across instances", r.status_code == 200)
+    by_id = {a["id"]: a for a in r.json()["articles"]}
+    check("missing article flagged in preview",
+          by_id["ghost"]["exists"] is False and by_id["ghost"]["segments"] == [])
+    check("preview confirms the submitted versions still match",
+          by_id["moji-1"]["version_match"] and by_id["moji-3"]["version_match"])
+
+    expected = {"moji-1": ["café", "€", "naïve", "’"], "moji-3": ["cafés", "’"]}
+    fixes, candidates_ok = {}, True
+    for aid, wants in expected.items():
+        got = []
+        for seg in by_id[aid]["segments"]:
+            valid = [c for c in seg["candidates"] if c["valid"]]
+            got.append(valid[0]["replacement"] if valid else None)
+            if valid:
+                fixes.setdefault(aid, []).append({
+                    "start": seg["start"], "end": seg["end"],
+                    "conversion": valid[0]["conversion"],
+                    "replacement": valid[0]["replacement"]})
+        candidates_ok = candidates_ok and got == wants
+    check("preview yields the expected repair candidates per segment", candidates_ok)
+    check("every non-convertible candidate explains why",
+          all(c["valid"] or c["reason"]
+              for a in by_id.values() if a["exists"]
+              for s in a["segments"] for c in s["candidates"]))
+    euro_seg = by_id["moji-1"]["segments"][1]
+    lat = next(c for c in euro_seg["candidates"] if c["conversion"] == "latin-1")
+    check("windows-1252-only mojibake not offered as latin-1",
+          not lat["valid"] and bool(lat["reason"]))
+
+    r = httpx.post(f"{base1}/encoding-fix/preview", json={"articles": [
+        {"id": "moji-1", "updated_generation": v1,
+         "intervals": [{"start": 0, "end": 3}, {"start": 500, "end": 600}]}]})
+    segs = r.json()["articles"][0]["segments"]
+    check("healthy ascii span offers no candidate (would be a no-op)",
+          all(not c["valid"] and c["reason"] for c in segs[0]["candidates"]))
+    check("out-of-bounds interval explained, no candidates",
+          segs[1]["error"] is not None and segs[1]["candidates"] == [])
+
+    # ---- confirm rejections: the whole batch must stay untouched -------------
+    bad = dict(fixes["moji-1"][0], replacement="definitely wrong")
+    r = httpx.post(f"{base1}/encoding-fix/confirm", json={"articles": [
+        {"id": "moji-1", "updated_generation": v1, "fixes": [bad]}]})
+    check("candidate mismatch rejected (409)", r.status_code == 409)
+    r = httpx.post(f"{base1}/encoding-fix/confirm", json={"articles": [
+        {"id": "moji-1", "updated_generation": v1 + 99, "fixes": fixes["moji-1"]}]})
+    check("stale updated_generation rejected (409)", r.status_code == 409)
+    r = httpx.post(f"{base1}/encoding-fix/confirm", json={"articles": [
+        {"id": "ghost", "updated_generation": 0,
+         "fixes": [{"start": 0, "end": 1, "conversion": "latin-1", "replacement": "x"}]}]})
+    check("confirm for a missing article rejected (409)", r.status_code == 409)
+    arts = {a["id"]: a for a in httpx.get(f"{base1}/articles").json()["articles"]}
+    check("rejected confirms changed nothing",
+          arts["moji-1"]["text"] == corrupted1 and arts["moji-3"]["text"] == corrupted3)
+    cur = httpx.get(f"{base1}/status").json()["current_generation"]
+    check("rejected confirms did not bump the corpus generation", cur == gen_seeded)
+
+    # ---- unrelated edits do not invalidate the confirm -----------------------
+    r = httpx.post(f"{base1}/articles/batch", json={"upserts": [
+        {"id": "unrelated-1", "side": "train", "text": "an unrelated article edited meanwhile"}]})
+    check("unrelated batch committed between preview and confirm", r.status_code == 200)
+    gen_before_fix = r.json()["generation"]
+
+    r = httpx.post(f"{base2}/encoding-fix/confirm", json={"articles": [
+        {"id": "moji-1", "updated_generation": v1, "fixes": fixes["moji-1"]},
+        {"id": "moji-3", "updated_generation": v3, "fixes": fixes["moji-3"]},
+    ]})
+    check("confirm succeeds despite the unrelated modification", r.status_code == 200)
+    body = r.json()
+    check("whole fix batch advanced the corpus generation exactly once",
+          body["generation"] == gen_before_fix + 1)
+    check("two articles and six segments fixed in one batch",
+          body["fixed_articles"] == 2 and body["fixed_segments"] == 6)
+    arts = {a["id"]: a for a in httpx.get(f"{base1}/articles").json()["articles"]}
+    check("spans repaired, rest of the text untouched",
+          arts["moji-1"]["text"] == clean_base and arts["moji-3"]["text"] == clean3)
+    check("fixed articles carry the new updated_generation",
+          arts["moji-1"]["updated_generation"] == body["generation"]
+          and arts["moji-3"]["updated_generation"] == body["generation"])
+
+    # ---- the repair triggers re-verification before any verdict --------------
+    r = httpx.get(f"{base1}/contamination")
+    check("202 (no stale verdict) while the repair awaits verification",
+          r.status_code == 202)
+    final = wait_ready(base1)
+    check("verification covers the repaired corpus",
+          final["published_generation"] == body["generation"])
+    r = httpx.get(f"{base1}/contamination")
+    report = r.json()
+    check("post-repair report serves exactly the fix generation",
+          r.status_code == 200 and report["generation"] == body["generation"])
+    member_sets = {frozenset(g["train_members"] + g["test_members"]) for g in report["groups"]}
+    check("repaired twin now forms a contamination group with its original",
+          frozenset({"moji-1", "moji-2"}) in member_sets)
+
+    # ---- one edited target poisons the whole confirm batch --------------------
+    r = httpx.post(f"{base1}/articles/batch", json={"upserts": [
+        {"id": "moji-4", "side": "train", "text": corrupted1},
+        {"id": "moji-5", "side": "test", "text": corrupted3}]})
+    arts = {a["id"]: a for a in httpx.get(f"{base1}/articles").json()["articles"]}
+    v4, v5 = arts["moji-4"]["updated_generation"], arts["moji-5"]["updated_generation"]
+    httpx.post(f"{base1}/articles/batch", json={"upserts": [
+        {"id": "moji-4", "side": "train", "text": corrupted1 + " (edited)"}]})
+    r = httpx.post(f"{base1}/encoding-fix/confirm", json={"articles": [
+        {"id": "moji-4", "updated_generation": v4, "fixes": fixes["moji-1"]},
+        {"id": "moji-5", "updated_generation": v5, "fixes": fixes["moji-3"]}]})
+    check("edited target rejects the whole confirm batch (409)", r.status_code == 409)
+    arts = {a["id"]: a for a in httpx.get(f"{base1}/articles").json()["articles"]}
+    check("untainted sibling article left unchanged by the rejected batch",
+          arts["moji-5"]["text"] == corrupted3)
+
+    # ---- the repaired text must keep satisfying the 5..2000 length limit -----
+    tiny = "ab" + mojibake("é", "latin-1") + "c"  # 5 chars; repair shrinks it to 4
+    httpx.post(f"{base1}/articles/batch", json={"upserts": [
+        {"id": "moji-tiny", "side": "train", "text": tiny}]})
+    arts = {a["id"]: a for a in httpx.get(f"{base1}/articles").json()["articles"]}
+    vt = arts["moji-tiny"]["updated_generation"]
+    s = tiny.index(mojibake("é", "latin-1"))
+    r = httpx.post(f"{base1}/encoding-fix/confirm", json={"articles": [
+        {"id": "moji-tiny", "updated_generation": vt, "fixes": [
+            {"start": s, "end": s + 2, "conversion": "latin-1", "replacement": "é"}]}]})
+    check("repair violating the 5-char minimum rejected (409)", r.status_code == 409)
+    arts = {a["id"]: a for a in httpx.get(f"{base1}/articles").json()["articles"]}
+    check("length-violating repair left the article unchanged",
+          arts["moji-tiny"]["text"] == tiny)
+
+    # ---- cleanup ---------------------------------------------------------------
+    ids = [a["id"] for a in httpx.get(f"{base1}/articles").json()["articles"]]
+    r = httpx.post(f"{base1}/articles/batch", json={"deletes": ids})
+    check("encoding checks cleaned up after themselves",
+          r.status_code == 200 and r.json()["articles"] == 0)
+    wait_ready(base1)
 
 
 if __name__ == "__main__":

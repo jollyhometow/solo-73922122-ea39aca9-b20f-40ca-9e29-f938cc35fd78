@@ -12,6 +12,12 @@ cover the whole currently committed corpus (published_generation ==
 current_generation); otherwise it answers 202 with the pending state, so
 stale groups are never paired with new texts and a "clean" verdict is
 never reported early.
+
+Encoding repair: crawled articles sometimes contain UTF-8 spans misdecoded
+as Latin-1 / Windows-1252. /encoding-fix/preview lists the repair
+candidates for selected spans; /encoding-fix/confirm applies a chosen set
+atomically (per-article optimistic versioning, one generation bump for the
+whole batch, re-verification before any verdict is served again).
 """
 
 import logging
@@ -25,8 +31,20 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, RedirectResponse
 
-from .db import MAX_ARTICLES, connect, get_meta, init_db
-from .schemas import BatchRequest, BatchResponse
+from .db import MAX_ARTICLES, MAX_TEXT_LEN, MIN_TEXT_LEN, connect, get_meta, init_db
+from .mojibake import CONVERSIONS, inverse_convert
+from .schemas import (
+    ArticlePreview,
+    BatchRequest,
+    BatchResponse,
+    CandidatePreview,
+    ConfirmRequest,
+    ConfirmResponse,
+    FixedArticle,
+    PreviewRequest,
+    PreviewResponse,
+    SegmentPreview,
+)
 from .worker import CompareWorker
 
 logging.basicConfig(
@@ -78,12 +96,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Corpus Contamination Checker",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Detects near-duplicate articles (5-char shingle Jaccard >= 0.8) "
         "across train/test corpora. Results are computed in the background, "
         "persisted per corpus generation and served only when they cover "
-        "the whole committed corpus."
+        "the whole committed corpus. Also offers a two-step encoding repair "
+        "API (preview/confirm) for UTF-8 spans misdecoded as Latin-1 or "
+        "Windows-1252."
     ),
     lifespan=lifespan,
 )
@@ -218,6 +238,273 @@ def list_articles():
             for r in rows
         ],
     }
+
+
+# ---------------------------------------------------------------------------
+# encoding repair (UTF-8 mojibake) — preview then confirm
+# ---------------------------------------------------------------------------
+
+
+def _preview_segment(text: str, start: int, end: int) -> SegmentPreview:
+    if end > len(text):
+        return SegmentPreview(
+            start=start,
+            end=end,
+            error=(
+                f"interval [{start}, {end}) is out of bounds for the current "
+                f"text of length {len(text)}"
+            ),
+        )
+    segment = text[start:end]
+    candidates = []
+    for conversion in CONVERSIONS:
+        replacement, reason = inverse_convert(segment, conversion)
+        candidates.append(
+            CandidatePreview(
+                conversion=conversion,
+                valid=replacement is not None,
+                replacement=replacement,
+                reason=reason,
+            )
+        )
+    return SegmentPreview(start=start, end=end, original=segment, candidates=candidates)
+
+
+@app.post("/encoding-fix/preview", response_model=PreviewResponse)
+def preview_encoding_fix(req: PreviewRequest):
+    """Preview repairs for UTF-8 spans misdecoded as Latin-1 / Windows-1252.
+
+    Selects up to 5 articles, each pinned to the ``updated_generation``
+    reported by ``GET /articles`` and carrying up to 6 non-overlapping
+    half-open character intervals. For every interval both inverse
+    conversions are attempted against the *current* text: valid candidates
+    are listed, non-convertible spans come with the reason. Read-only —
+    use ``/encoding-fix/confirm`` to apply a selection.
+    """
+    ids = [a.id for a in req.articles]
+    if len(ids) != len(set(ids)):
+        raise HTTPException(422, "duplicate article ids in request")
+
+    conn = connect(DB_PATH)
+    try:
+        conn.execute("BEGIN")
+        previews = []
+        for sel in req.articles:
+            row = conn.execute(
+                "SELECT text, updated_generation FROM articles WHERE id = ?",
+                (sel.id,),
+            ).fetchone()
+            if row is None:
+                previews.append(
+                    ArticlePreview(
+                        id=sel.id,
+                        exists=False,
+                        submitted_updated_generation=sel.updated_generation,
+                        version_match=False,
+                    )
+                )
+                continue
+            text = row["text"]
+            segments = [
+                _preview_segment(text, iv.start, iv.end)
+                for iv in sorted(sel.intervals, key=lambda i: (i.start, i.end))
+            ]
+            previews.append(
+                ArticlePreview(
+                    id=sel.id,
+                    exists=True,
+                    submitted_updated_generation=sel.updated_generation,
+                    current_updated_generation=row["updated_generation"],
+                    version_match=row["updated_generation"] == sel.updated_generation,
+                    segments=segments,
+                )
+            )
+        conn.commit()
+        return PreviewResponse(articles=previews)
+    finally:
+        conn.close()
+
+
+def _splice(text: str, splices) -> str:
+    """Replace the sorted, non-overlapping ``(start, end, replacement)``
+    spans of *text*, leaving everything else byte-identical."""
+    parts, pos = [], 0
+    for start, end, replacement in splices:
+        parts.append(text[pos:start])
+        parts.append(replacement)
+        pos = end
+    parts.append(text[pos:])
+    return "".join(parts)
+
+
+@app.post("/encoding-fix/confirm", response_model=ConfirmResponse)
+def confirm_encoding_fix(req: ConfirmRequest):
+    """Apply one atomic batch of encoding repairs.
+
+    Every selected article is re-read inside a single transaction: its
+    ``updated_generation`` must still match (the article was not edited
+    since the preview — edits of *unrelated* articles do not matter), each
+    interval must be in bounds, and each chosen candidate is recomputed
+    from the current text and must match the submitted replacement. The
+    repaired text must keep satisfying the 5–2000 character limit. If any
+    check fails, the whole batch is rolled back (409) and nothing changes.
+    On success all repairs commit together, the corpus generation advances
+    exactly once and a fresh verification is enqueued — ``/contamination``
+    answers 202 until it covers the repaired corpus.
+    """
+    ids = [a.id for a in req.articles]
+    if len(ids) != len(set(ids)):
+        raise HTTPException(422, "duplicate article ids in request")
+
+    conn = connect(DB_PATH)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            current, _ = get_meta(conn)
+            new_generation = current + 1
+
+            errors = []
+            planned = []  # (id, new_text, segment_count)
+            for sel in req.articles:
+                row = conn.execute(
+                    "SELECT text, updated_generation FROM articles WHERE id = ?",
+                    (sel.id,),
+                ).fetchone()
+                if row is None:
+                    errors.append(
+                        {"id": sel.id, "reason": "article does not exist (anymore)"}
+                    )
+                    continue
+                text = row["text"]
+                if row["updated_generation"] != sel.updated_generation:
+                    errors.append(
+                        {
+                            "id": sel.id,
+                            "reason": (
+                                "article was modified since the preview: current "
+                                f"updated_generation is {row['updated_generation']}, "
+                                f"submitted {sel.updated_generation}"
+                            ),
+                        }
+                    )
+                    continue
+
+                splices = []
+                article_error = None
+                for f in sorted(sel.fixes, key=lambda i: (i.start, i.end)):
+                    if f.end > len(text):
+                        article_error = {
+                            "id": sel.id,
+                            "start": f.start,
+                            "end": f.end,
+                            "reason": (
+                                f"interval [{f.start}, {f.end}) is out of bounds "
+                                f"for the current text of length {len(text)}"
+                            ),
+                        }
+                        break
+                    segment = text[f.start : f.end]
+                    replacement, reason = inverse_convert(segment, f.conversion)
+                    if replacement is None:
+                        article_error = {
+                            "id": sel.id,
+                            "start": f.start,
+                            "end": f.end,
+                            "reason": (
+                                f"chosen {f.conversion} candidate is not valid "
+                                f"for the current text: {reason}"
+                            ),
+                        }
+                        break
+                    if replacement != f.replacement:
+                        article_error = {
+                            "id": sel.id,
+                            "start": f.start,
+                            "end": f.end,
+                            "reason": (
+                                "candidate mismatch: submitted replacement does "
+                                "not match the candidate recomputed from the "
+                                f"current text ({replacement!r})"
+                            ),
+                        }
+                        break
+                    splices.append((f.start, f.end, replacement))
+                if article_error is not None:
+                    errors.append(article_error)
+                    continue
+
+                new_text = _splice(text, splices)
+                if not MIN_TEXT_LEN <= len(new_text) <= MAX_TEXT_LEN:
+                    errors.append(
+                        {
+                            "id": sel.id,
+                            "reason": (
+                                f"repaired text would be {len(new_text)} "
+                                f"characters, outside the allowed "
+                                f"{MIN_TEXT_LEN}..{MAX_TEXT_LEN}"
+                            ),
+                        }
+                    )
+                    continue
+                planned.append((sel.id, new_text, len(splices)))
+
+            if errors:
+                raise HTTPException(
+                    409,
+                    detail={
+                        "message": "encoding fix rejected, nothing applied",
+                        "errors": errors,
+                    },
+                )
+
+            for article_id, new_text, _ in planned:
+                conn.execute(
+                    "UPDATE articles SET text = ?, updated_generation = ?"
+                    " WHERE id = ?",
+                    (new_text, new_generation, article_id),
+                )
+            conn.execute(
+                "UPDATE meta SET current_generation = ? WHERE id = 1",
+                (new_generation,),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO compute_jobs (generation, status)"
+                " VALUES (?, 'pending')",
+                (new_generation,),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+        _, published = get_meta(conn)
+        log.info(
+            "encoding fix committed: generation=%d articles=%d segments=%d",
+            new_generation,
+            len(planned),
+            sum(n for _, _, n in planned),
+        )
+        return ConfirmResponse(
+            changed=True,
+            generation=new_generation,
+            published_generation=published,
+            fixed_articles=len(planned),
+            fixed_segments=sum(n for _, _, n in planned),
+            articles=[
+                FixedArticle(
+                    id=article_id,
+                    text_length=len(new_text),
+                    updated_generation=new_generation,
+                )
+                for article_id, new_text, _ in planned
+            ],
+        )
+    except HTTPException:
+        raise
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(409, f"encoding fix rejected, nothing applied: {exc}")
+    finally:
+        conn.close()
 
 
 @app.get("/contamination")

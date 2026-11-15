@@ -7,6 +7,9 @@ seed        load the demo corpus (direct near-duplicate pair, a *bridge*
             article connecting a train and a test article, clean articles)
 bridge      delete the bridge article -> its contamination group splits;
             re-add it -> the group forms again
+encoding    repair UTF-8 spans misdecoded as Latin-1 / Windows-1252:
+            preview the per-segment candidates, confirm the selection,
+            watch the corpus re-verify before any verdict is served
 concurrent  submit batches while a background comparison is running:
             the API keeps accepting writes, answers 202 until verification
             covers the latest corpus, and stale computations are discarded
@@ -268,6 +271,90 @@ def scenario_bridge(base):
     print("bridge scenario done.\n")
 
 
+def mojibake(text, codec):
+    """Reproduce the crawler corruption: UTF-8 bytes decoded with the wrong
+    single-byte charset (``latin-1`` or ``cp1252``)."""
+    return text.encode("utf-8").decode(codec)
+
+
+def scenario_encoding(base):
+    print("== encoding: repairing mojibake spans (preview -> confirm) ==")
+    reset_to_seed(base)
+
+    # One article whose non-ASCII spans were stored as UTF-8 misdecoded as
+    # Latin-1 / Windows-1252; repairing the whole text at once would damage
+    # the healthy parts, so only the corrupted spans are selected.
+    clean = "the café terrace charges €5 for coffee while naïve visitors don’t mind"
+    spans_moji = [
+        (mojibake("café", "latin-1"), "café"),
+        (mojibake("€", "cp1252"), "€"),
+        (mojibake("naïve", "latin-1"), "naïve"),
+        (mojibake("’", "cp1252"), "’"),
+    ]
+    corrupted = clean
+    for broken, fixed in spans_moji:
+        corrupted = corrupted.replace(fixed, broken)
+    print(f"  corrupted text: {corrupted}")
+
+    code, body = http(base, "POST", "/articles/batch",
+                      {"upserts": [{"id": "fix-mojibake-1", "side": "train", "text": corrupted}]})
+    expect(code == 200, f"corrupted article committed (generation {body['generation']})")
+
+    code, body = http(base, "GET", "/articles")
+    stored = next(a for a in body["articles"] if a["id"] == "fix-mojibake-1")
+    version = stored["updated_generation"]
+
+    def span(needle):
+        start = corrupted.index(needle)
+        return {"start": start, "end": start + len(needle)}
+
+    intervals = [span(broken) for broken, _ in spans_moji]
+    code, preview = http(base, "POST", "/encoding-fix/preview",
+                         {"articles": [{"id": "fix-mojibake-1",
+                                        "updated_generation": version,
+                                        "intervals": intervals}]})
+    expect(code == 200, "preview accepted")
+    article_preview = preview["articles"][0]
+    expect(article_preview["version_match"], "submitted updated_generation still matches")
+
+    fixes = []
+    for seg in article_preview["segments"]:
+        valid = [c for c in seg["candidates"] if c["valid"]]
+        expect(valid, f"segment [{seg['start']}, {seg['end']}) has a valid candidate")
+        chosen = valid[0]
+        for cand in seg["candidates"]:
+            note = repr(cand["replacement"]) if cand["valid"] else f"no candidate ({cand['reason']})"
+            print(f"    [{seg['start']:>2},{seg['end']:>2}) {seg['original']!r} {cand['conversion']}: {note}")
+        fixes.append({"start": seg["start"], "end": seg["end"],
+                      "conversion": chosen["conversion"],
+                      "replacement": chosen["replacement"]})
+
+    code, confirmed = http(base, "POST", "/encoding-fix/confirm",
+                           {"articles": [{"id": "fix-mojibake-1",
+                                          "updated_generation": version,
+                                          "fixes": fixes}]})
+    expect(code == 200, f"confirm committed (generation {confirmed.get('generation')})")
+    code, body = http(base, "GET", "/articles")
+    stored = next(a for a in body["articles"] if a["id"] == "fix-mojibake-1")
+    expect(stored["text"] == clean, "spans repaired, rest of the text untouched")
+    print(f"  repaired text:  {stored['text']}")
+
+    # Replaying the same confirm now fails: the article's version moved on.
+    code, body = http(base, "POST", "/encoding-fix/confirm",
+                      {"articles": [{"id": "fix-mojibake-1",
+                                     "updated_generation": version,
+                                     "fixes": fixes}]})
+    expect(code == 409, "stale updated_generation rejected (409), nothing applied")
+
+    code, report = get_contamination(base)
+    expect(code == 202, "202 while the repair awaits verification (no stale verdict)")
+    wait_ready(base)
+    code, report = get_contamination(base)
+    expect(code == 200 and report["generation"] == confirmed["generation"],
+           "verification covers the repaired corpus")
+    print("encoding scenario done.\n")
+
+
 def scenario_concurrent(base):
     print("== concurrent: submitting while a comparison is running ==")
     _, status = http(base, "GET", "/status")
@@ -371,7 +458,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "scenario",
-        choices=["seed", "bridge", "concurrent", "restart", "all", "wait", "status"],
+        choices=["seed", "bridge", "encoding", "concurrent", "restart", "all", "wait", "status"],
     )
     parser.add_argument("--base", default=DEFAULT_BASE, help="API base URL")
     parser.add_argument(
@@ -392,6 +479,8 @@ def main():
         scenario_seed(base)
     elif args.scenario == "bridge":
         scenario_bridge(base)
+    elif args.scenario == "encoding":
+        scenario_encoding(base)
     elif args.scenario == "concurrent":
         scenario_concurrent(base)
     elif args.scenario == "restart":
@@ -399,6 +488,7 @@ def main():
     elif args.scenario == "all":
         scenario_seed(base)
         scenario_bridge(base)
+        scenario_encoding(base)
         scenario_concurrent(base)
         scenario_restart(base, args.restart_cmd)
 

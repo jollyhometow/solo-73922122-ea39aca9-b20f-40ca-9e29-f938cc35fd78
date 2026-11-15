@@ -1,7 +1,9 @@
 # Corpus Contamination Checker
 
 新闻语料近重复核查服务：在模型评测前找出训练集与测试集之间的近重复文章，
-帮助语料工程师决定撤下哪些测试材料。
+帮助语料工程师决定撤下哪些测试材料。另附**编码修复 API**：针对抓取时被
+Latin-1 / Windows-1252 误解码的局部 UTF-8 片段（mojibake），先预览候选、
+再原子确认修复，避免整篇转码伤及正常文字。
 
 - **FastAPI + SQLite**，两个 API 进程共享同一个数据库文件（WAL）
 - 以**原文连续 5 字符 shingle 集合的 Jaccard 相似度 ≥ 0.8** 连边，按连通分量分组
@@ -52,7 +54,10 @@ python3 scripts/demo.py bridge --base http://localhost:8002
 #    期间查询得到 202；旧代次的计算结果被丢弃，最终只发布最新代次
 python3 scripts/demo.py concurrent --base http://localhost:8001
 
-# 4) 重启：提交一批后立即重启两个进程，核查在重启后自动补完，无需重新提交
+# 4) 编码修复：对误解码片段预览两种逆转换候选，确认后原子修复并重新核查
+python3 scripts/demo.py encoding --base http://localhost:8002
+
+# 5) 重启：提交一批后立即重启两个进程，核查在重启后自动补完，无需重新提交
 python3 scripts/demo.py restart --base http://localhost:8001 \
     --restart-cmd "docker compose restart api1 api2"
 # 本地模式：--restart-cmd "scripts/local_dev.sh restart"
@@ -65,7 +70,9 @@ python3 scripts/demo.py restart --base http://localhost:8001 \
 | 方法/路径 | 说明 |
 |---|---|
 | `POST /articles/batch` | 整批补录/更正/删除：`{"upserts": [{id, side, text}], "deletes": [id]}`。**单事务原子生效**，任一失败整批回滚 |
-| `GET /articles` | 当前已提交语料列表 |
+| `GET /articles` | 当前已提交语料列表（含每篇的 `updated_generation`） |
+| `POST /encoding-fix/preview` | 编码修复预览：至多 5 篇、每篇至多 6 个互不重叠半开区间；逐段给出 Latin-1 / Windows-1252 两种逆转换的有效候选，无法转换的说明原因（只读） |
+| `POST /encoding-fix/confirm` | 编码修复确认：单事务内按当前原文重算并核对版本/区间/候选/长度，全部通过才整批提交；语料代次只推进一次并重新核查 |
 | `GET /contamination` | 核查结论。`200`：跨集合污染组、成员、直接相似边；`202`：待核查（附 current/published 代次） |
 | `GET /status` | 实例、代次、语料计数、后台作业状态 |
 | `GET /docs` | Swagger UI |
@@ -127,6 +134,32 @@ python3 scripts/demo.py restart --base http://localhost:8001 \
 - **重启自动补完**：启动时若 `current_generation > published_generation`
   自动补建待比对作业；作业租约机制保证崩溃进程未完成的任务被接管。
 
+## 设计：编码修复（mojibake）如何不越修越坏
+
+抓取入库的稿件偶尔混有"UTF-8 字节被当作 Latin-1 / Windows-1252 解码"的
+局部乱码（如 `cafÃ©`、`â‚¬`）。整篇转码会把正常文字也卷进去，所以修复
+以**片段**为单位，并分预览 / 确认两步：
+
+```
+GET /articles            -> 取每篇的 updated_generation（每篇各自的版本号）
+POST /encoding-fix/preview -> 逐段试两种逆转换，列出有效候选 / 失败原因
+POST /encoding-fix/confirm -> 选定各段候选，单事务核对后整批生效
+```
+
+- **逆转换**：候选 = `segment.encode(误解码字符集).decode("utf-8")`。
+  编码失败（含该字符集无法表示的字符）、解码失败（字节不是合法 UTF-8）
+  或转换后文本不变，都不构成有效候选，预览会给出具体原因——正常文字
+  （如本来就正确的 `é`、纯 ASCII）因此永远不会被"修复"。
+- **每篇乐观版本**：确认按 `updated_generation` 核对目标文章是否被批改过；
+  **无关文章的批改不影响确认**（它只推进全库代次，不动目标文章的版本）。
+- **确认即重算**：确认事务内重新读取当前原文、重新计算候选，逐一比对
+  提交的替换文本；区间越界、候选不符、版本不符、修复后超出 5–2000 字符
+  限制，任一发生则**整批回滚（409）**，已选中的其他文章也不生效。
+- **其余部分保持不变**：只替换选定区间，区间外文本逐字不动。
+- **代次只推进一次**：整批修复（1–5 篇）合一次 `current_generation+1`
+  并入队核查作业；核查发布前 `/contamination` 一律 202，不会返回
+  修复前的旧污染结论。
+
 ## 配置（环境变量）
 
 | 变量 | 默认 | 说明 |
@@ -140,21 +173,23 @@ python3 scripts/demo.py restart --base http://localhost:8001 \
 ## 验证
 
 ```bash
-python3 tests/e2e_check.py     # 34 项需求检查：校验、原子性、300 上限、202 门控、
-                               # 桥接拆组、并发提交、旧算丢弃、崩溃重启恢复、不混版
+python3 tests/e2e_check.py     # 69 项需求检查：校验、原子性、300 上限、202 门控、
+                               # 桥接拆组、并发提交、旧算丢弃、崩溃重启恢复、不混版、
+                               # 编码修复预览/确认、乐观版本、整批回滚、修复后重新核查
 ```
 
 ## 结构
 
 ```
 app/
-  main.py        FastAPI 端点与生命周期
+  main.py        FastAPI 端点与生命周期（含 /encoding-fix/preview|confirm）
   db.py          SQLite 连接/建表（WAL）
   similarity.py  5 字符 shingle、Jaccard、连通分量
+  mojibake.py    UTF-8 误解码片段的逆转换（Latin-1 / Windows-1252）
   worker.py      后台比对 worker（租约认领、快照、原子发布）
-  schemas.py     请求模型（5–2000 字符等校验）
+  schemas.py     请求模型（5–2000 字符、修复区间等校验）
 scripts/
-  demo.py        演示数据（含桥接文章）+ 四个场景
+  demo.py        演示数据（含桥接文章）+ 五个场景
   local_dev.sh   无 Docker 的双进程本地运行器
 tests/
   e2e_check.py   端到端需求验证（自起两个进程共库）
